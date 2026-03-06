@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+
+# uv
+uv.lock
+
+# Secrets
+.env
+mcp.json
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# SQLite databases (dev artifacts)
+*.db
+*.db-shm
+*.db-wal
