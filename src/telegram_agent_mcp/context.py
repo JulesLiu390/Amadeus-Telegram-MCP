@@ -140,20 +140,23 @@ class ContextManager:
         logger.info("Long-polling listener stopped")
 
     def get_context(self, chat_id: str, limit: int = 20) -> dict:
-        """Get message context for a chat."""
+        """Get message context for a chat.
+
+        Returns dict with 'target' key (unified with QQ MCP interface).
+        """
         key = self._buffer_key(chat_id)
         buf = self._buffers.get(key)
 
         if buf is None:
             return {
-                "chat_id": chat_id,
+                "target": chat_id,
                 "compressed_summary": None,
                 "message_count": 0,
                 "messages": [],
             }
 
         return {
-            "chat_id": chat_id,
+            "target": chat_id,
             "compressed_summary": buf.compressed_summary,
             "message_count": buf.count,
             "messages": buf.get_recent(limit),

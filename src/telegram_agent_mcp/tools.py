@@ -205,7 +205,8 @@ def register_tools(
 
     @mcp.tool()
     async def get_recent_context(
-        chat_id: str,
+        target: str,
+        target_type: str = "group",
         limit: int = 200,
     ) -> dict:
         """Get recent message context for a monitored Telegram chat.
@@ -214,9 +215,11 @@ def register_tools(
         Use compress_context to manually compress when needed.
 
         Args:
-            chat_id: Telegram chat ID (group, supergroup, or private chat).
+            target: Telegram chat ID (group, supergroup, or private chat).
+            target_type: 'group' or 'private' (for interface compatibility).
             limit: Number of recent messages to return (default 200).
         """
+        chat_id = target
         if not config.is_chat_monitored(chat_id):
             return {"error": f"Chat {chat_id} is not monitored"}
 
@@ -225,42 +228,50 @@ def register_tools(
 
         try:
             chat_info = await bot.get_chat(chat_id)
-            result["chat_title"] = chat_info.get("title", chat_info.get("first_name", ""))
-            result["chat_type"] = chat_info.get("type", "")
+            chat_type = chat_info.get("type", "")
+            title = chat_info.get("title", chat_info.get("first_name", ""))
+            if chat_type == "private":
+                result["friend_name"] = title
+            else:
+                result["group_name"] = title
         except Exception:
-            result["chat_title"] = ""
-            result["chat_type"] = ""
+            pass
 
         return result
 
     @mcp.tool()
     async def batch_get_recent_context(
-        chat_ids: list[str],
+        targets: list[dict],
         limit: int = 50,
     ) -> dict:
         """Batch query recent message context for multiple Telegram chats.
 
         Args:
-            chat_ids: List of chat ID strings.
+            targets: List of objects with 'target' (chat ID) and 'target_type' ('group' or 'private').
             limit: Number of recent messages per chat (default 50).
         """
         limit = max(1, min(limit, 200))
 
         results: list[dict] = []
-        for cid in chat_ids:
-            if not config.is_chat_monitored(cid):
-                results.append({"chat_id": cid, "error": f"Chat {cid} is not monitored"})
+        for entry in targets:
+            chat_id = entry.get("target", "") if isinstance(entry, dict) else str(entry)
+
+            if not config.is_chat_monitored(chat_id):
+                results.append({"target": chat_id, "error": f"Chat {chat_id} is not monitored"})
                 continue
 
-            result = ctx.get_context(cid, limit)
+            result = ctx.get_context(chat_id, limit)
 
             try:
-                chat_info = await bot.get_chat(cid)
-                result["chat_title"] = chat_info.get("title", chat_info.get("first_name", ""))
-                result["chat_type"] = chat_info.get("type", "")
+                chat_info = await bot.get_chat(chat_id)
+                chat_type = chat_info.get("type", "")
+                title = chat_info.get("title", chat_info.get("first_name", ""))
+                if chat_type == "private":
+                    result["friend_name"] = title
+                else:
+                    result["group_name"] = title
             except Exception:
-                result["chat_title"] = ""
-                result["chat_type"] = ""
+                pass
 
             results.append(result)
 
@@ -268,8 +279,9 @@ def register_tools(
 
     @mcp.tool()
     async def send_message(
-        chat_id: str,
+        target: str,
         content: str,
+        target_type: str = "group",
         reply_to: int | None = None,
         split_content: bool = True,
         num_chunks: int | None = None,
@@ -277,8 +289,9 @@ def register_tools(
         """Send a message to a monitored Telegram chat.
 
         Args:
-            chat_id: Telegram chat ID.
+            target: Telegram chat ID.
             content: Text message content.
+            target_type: 'group' or 'private' (for interface compatibility).
             reply_to: Optional message ID to reply to.
             split_content: Whether to split long messages into multiple chunks
                 with typing delay (default True). Set to False to send as a
@@ -286,6 +299,7 @@ def register_tools(
             num_chunks: If set, split the message into exactly this many chunks
                 using natural punctuation boundaries. Overrides split_content.
         """
+        chat_id = target
         if not config.is_chat_monitored(chat_id):
             return {"success": False, "error": f"Chat {chat_id} is not monitored"}
 
@@ -384,23 +398,26 @@ def register_tools(
             "success": True,
             "message_ids": sent_ids,
             "chunks": len(chunks),
-            "chat_id": chat_id,
+            "target": chat_id,
             "timestamp": datetime.now(CST).isoformat(),
             "recent_messages": recent_lines,
         }
 
     @mcp.tool()
     async def compress_context(
-        chat_id: str,
+        target: str,
         ctx_mcp: Context,
+        target_type: str = "group",
     ) -> dict:
         """Compress all buffered messages for a chat into a summary.
 
         This replaces raw messages with a compressed summary, freeing up the buffer.
 
         Args:
-            chat_id: Telegram chat ID.
+            target: Telegram chat ID.
+            target_type: 'group' or 'private' (for interface compatibility).
         """
+        chat_id = target
         if not config.is_chat_monitored(chat_id):
             return {"error": f"Chat {chat_id} is not monitored"}
 

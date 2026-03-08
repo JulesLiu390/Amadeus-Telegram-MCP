@@ -115,7 +115,7 @@ class TestContextManager:
     def test_get_context_empty(self, config):
         ctx = ContextManager(config)
         result = ctx.get_context("-100111")
-        assert result["chat_id"] == "-100111"
+        assert result["target"] == "-100111"
         assert result["message_count"] == 0
         assert result["messages"] == []
         assert result["compressed_summary"] is None
