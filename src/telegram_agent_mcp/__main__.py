@@ -6,6 +6,7 @@ import sys
 
 from .config import Config
 from .server import run_server
+from .topics import normalize_target
 
 
 def parse_args() -> Config:
@@ -53,7 +54,8 @@ def parse_args() -> Config:
 
     chat_ids: set[str] | None = None
     if args.chat_ids:
-        chat_ids = set(args.chat_ids.split(","))
+        # 白名单里也可能直接粘了 t.me 链接，统一成规范写法再比对
+        chat_ids = {normalize_target(c) for c in args.chat_ids.split(",") if c.strip()}
 
     user_ids: set[str] | None = None
     if args.user_ids:

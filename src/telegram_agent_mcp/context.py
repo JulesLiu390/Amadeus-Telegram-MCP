@@ -8,6 +8,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 
 from .config import Config
+from .topics import learned_topic_name, make_target, topic_thread_id
+
+# PetGPT 会校验图片魔数，只认这几种；别的图片格式改用缩略图
+VIEWABLE_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"}
+
+
+def _thumbnail_id(obj: dict) -> str:
+    """Bot API 新版字段叫 thumbnail，旧版叫 thumb。"""
+    thumb = obj.get("thumbnail") or obj.get("thumb") or {}
+    return thumb.get("file_id", "")
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +38,10 @@ class Message:
     is_self: bool = False
     image_urls: list[str] = field(default_factory=list)
     received_at: float = field(default_factory=time.time)
+    # 编辑过的消息：Telegram 的编辑不换 message_id，下游按 ID 去重会把新内容当
+    # 重复丢掉。带上这个标记，PetGPT 才知道「同一个 ID、内容变了」是一次编辑。
+    edited: bool = False
+    edit_date: str = ""  # ISO 8601，编辑发生的时间
 
     def to_dict(self) -> dict:
         d = {
@@ -42,6 +56,9 @@ class Message:
         }
         if self.image_urls:
             d["image_urls"] = self.image_urls
+        if self.edited:
+            d["edited"] = True
+            d["edit_date"] = self.edit_date
         return d
 
 
@@ -55,6 +72,15 @@ class MessageBuffer:
         self._msg_since_compress: int = 0
         self._compress_every = compress_every
         self._compress_pending = False
+
+    def upsert(self, msg: Message) -> None:
+        """编辑过的消息：原地换掉同 ID 的那条；不在缓冲里（太旧被挤掉了）就当新消息加。"""
+        if msg.message_id and msg.message_id in self._seen_ids:
+            for i, old in enumerate(self.messages):
+                if old.message_id == msg.message_id:
+                    self.messages[i] = msg
+                    return
+        self.add(msg)
 
     def add(self, msg: Message) -> None:
         """Add a message with dedup by message_id."""
@@ -104,6 +130,8 @@ class ContextManager:
         self._poll_task: asyncio.Task | None = None
         self._running = False
         self._update_offset: int | None = None
+        # 话题 target（"chat:thread"）→ 话题名。Bot API 没有列话题的接口，只能边收边记
+        self._topic_names: dict[str, str] = {}
 
     def _buffer_key(self, chat_id: str) -> str:
         return str(chat_id)
@@ -176,6 +204,10 @@ class ContextManager:
             return []
         return buf.get_since(since)
 
+    def topic_name(self, target: str) -> str:
+        """已知的话题名；没见过的话题返回空串。"""
+        return self._topic_names.get(target, "")
+
     @property
     def buffer_stats(self) -> dict:
         """Summary stats for check_status."""
@@ -213,8 +245,9 @@ class ContextManager:
                         or update.get("channel_post")
                         or update.get("edited_channel_post")
                     )
+                    edited = bool(update.get("edited_message") or update.get("edited_channel_post"))
                     if message:
-                        await self._handle_message(message)
+                        await self._handle_message(message, edited=edited)
 
             except asyncio.CancelledError:
                 raise
@@ -225,13 +258,60 @@ class ContextManager:
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, max_retry)
 
+    # ── Alias Resolution ─────────────────────────────────
+
+    async def _lazy_resolve_alias(self, numeric_id: str) -> bool:
+        """Try to match a numeric chat_id to a configured @username alias."""
+        if not self.config.chat_ids or not self.bot:
+            return False
+        # Only try if there are unresolved @usernames in config
+        unresolved = [c for c in self.config.chat_ids
+                      if c.startswith("@") and c not in self.config._chat_aliases]
+        if not unresolved:
+            return False
+        try:
+            chat_info = await self.bot.get_chat(numeric_id)
+            username = chat_info.get("username", "")
+            if username:
+                at_username = f"@{username}"
+                if at_username in self.config.chat_ids:
+                    self.config._chat_aliases[at_username] = numeric_id
+                    self.config.chat_ids.add(numeric_id)
+                    logger.info("Poller lazy-resolved %s → %s", at_username, numeric_id)
+                    return True
+        except Exception as e:
+            logger.debug("Lazy alias resolution failed for %s: %s", numeric_id, e)
+        return False
+
+    # ── User Alias Resolution ─────────────────────────────
+
+    def _track_user_alias(self, sender_id: str, from_user: dict) -> None:
+        """Always record @username → numeric_id mapping for private chat senders."""
+        username = from_user.get("username", "")
+        if not username:
+            return
+        at_username = f"@{username}"
+        if at_username not in self.config._user_aliases:
+            self.config._user_aliases[at_username] = sender_id
+            if self.config.user_ids is not None:
+                self.config.user_ids.add(sender_id)
+            logger.info("Tracked user alias %s → %s", at_username, sender_id)
+
     # ── Message Handling ───────────────────────────────────
 
-    async def _handle_message(self, message: dict) -> None:
+    async def _handle_message(self, message: dict, edited: bool = False) -> None:
         """Process a Telegram message update."""
         chat = message.get("chat", {})
         chat_id = str(chat.get("id", ""))
         chat_type = chat.get("type", "")
+        # 论坛群里每个话题是一个独立的 target；General 和普通群就是 chat_id 本身
+        thread_id = topic_thread_id(message)
+        target = make_target(chat_id, thread_id)
+
+        # 话题名要在内容过滤之前记：创建/改名话题的是没有正文的服务消息
+        learned = learned_topic_name(message)
+        if learned:
+            self._topic_names[make_target(chat_id, learned[0])] = learned[1]
 
         # "from" may be absent for channel posts; fall back to sender_chat
         from_user = message.get("from") or message.get("sender_chat") or {}
@@ -239,12 +319,25 @@ class ContextManager:
 
         if chat_type == "private":
             if not self.config.is_user_monitored(sender_id):
-                return
+                # Try matching from.username against @username in user_ids
+                self._track_user_alias(sender_id, from_user)
+                if not self.config.is_user_monitored(sender_id):
+                    return
+            # Always track alias for resolved private chats (so tools can resolve @username)
+            self._track_user_alias(sender_id, from_user)
         else:
-            if not self.config.is_chat_monitored(chat_id):
-                return
+            # 白名单可以写整个群（含所有话题），也可以只写某个话题 "chat:thread"
+            if not (self.config.is_chat_monitored(chat_id)
+                    or (thread_id and self.config.is_chat_monitored(target))):
+                # Lazy alias resolution: resolve numeric ID → @username
+                if not await self._lazy_resolve_alias(chat_id):
+                    return
 
         is_self = sender_id == self.config.bot_id
+
+        # Use @username as sender_id for display (if available)
+        username = from_user.get("username", "")
+        sender_id_display = f"@{username}" if username else sender_id
 
         content, is_at_me, image_urls = await self._parse_message(message)
         if not content.strip():
@@ -255,28 +348,44 @@ class ContextManager:
         message_id = str(message.get("message_id", ""))
 
         msg = Message(
-            sender_id=sender_id,
+            sender_id=sender_id_display,
             sender_name=sender_name,
             content=content,
             timestamp=timestamp,
             message_id=message_id,
-            chat_id=chat_id,
+            chat_id=target,
             is_at_me=is_at_me,
             is_self=is_self,
             image_urls=image_urls,
+            edited=edited,
+            edit_date=self._format_timestamp(message.get("edit_date", 0)) if edited else "",
         )
 
-        key = self._buffer_key(chat_id)
+        key = self._buffer_key(target)
         buf = self._get_or_create_buffer(key)
-        buf.add(msg)
+        if edited:
+            buf.upsert(msg)
+        else:
+            buf.add(msg)
 
         logger.debug(
             "Chat %s | %s: %s%s",
-            chat_id, sender_name, content[:50],
+            target, sender_name, content[:50],
             " [@me]" if is_at_me else "",
         )
 
     # ── Message Parsing ────────────────────────────────────
+
+    async def _file_url(self, file_id: str) -> str | None:
+        """file_id → 可下载的 URL；拿不到（没有 bot、文件过大、API 报错）就是 None。"""
+        if not file_id or not self.bot:
+            return None
+        try:
+            file_path = (await self.bot.get_file(file_id)).get("file_path", "")
+        except Exception as e:
+            logger.warning("Failed to get file URL: %s", e)
+            return None
+        return self.bot.get_file_url(file_path) if file_path else None
 
     async def _parse_message(self, message: dict) -> tuple[str, bool, list[str]]:
         """Parse a Telegram Message object into text content.
@@ -289,6 +398,10 @@ class ContextManager:
 
         # Reply reference — Telegram includes the full replied message
         reply = message.get("reply_to_message")
+        # 论坛话题里的普通消息，reply_to_message 是「创建话题」那条服务消息——那不是
+        # 回复，不跳过的话每条话题消息都会被标成「回复了 xxx 的「」」
+        if reply and reply.get("forum_topic_created"):
+            reply = None
         if reply:
             reply_sender = self._get_sender_name(reply.get("from", {}))
             reply_sender_id = str(reply.get("from", {}).get("id", "?"))
@@ -324,25 +437,30 @@ class ContextManager:
         if message.get("photo"):
             photos = message["photo"]
             largest = max(photos, key=lambda p: p.get("file_size", 0))
-            file_id = largest.get("file_id", "")
-            if file_id and self.bot:
-                try:
-                    file_info = await self.bot.get_file(file_id)
-                    file_path = file_info.get("file_path", "")
-                    if file_path:
-                        image_urls.append(self.bot.get_file_url(file_path))
-                except Exception as e:
-                    logger.warning("Failed to get file URL: %s", e)
-            if not text and not caption:
-                parts.append("[图片]")
+            url = await self._file_url(largest.get("file_id", ""))
+            if url:
+                image_urls.append(url)
+            # 有配文也要标：图片万一没到模型那里（下载失败、被裁掉），它至少知道
+            # 这里有过一张图，不会回「只看到你发了这一句」
+            parts.append(" [图片]" if content_text else "[图片]")
 
-        # Sticker
-        if message.get("sticker"):
-            emoji = message["sticker"].get("emoji", "")
-            parts.append(f"[贴纸{emoji}]")
+        # Sticker —— 静态贴纸本身就是 webp，直接给模型看；动态（.tgs）和
+        # 视频（.webm）贴纸不是图片，用它的缩略图
+        sticker = message.get("sticker")
+        if sticker:
+            if sticker.get("is_animated") or sticker.get("is_video"):
+                url = await self._file_url(_thumbnail_id(sticker))
+            else:
+                url = await self._file_url(sticker.get("file_id", ""))
+            if url:
+                image_urls.append(url)
+            parts.append(f"[贴纸{sticker.get('emoji', '')}]")
 
-        # Video / GIF
+        # Video / GIF —— Telegram 的 GIF 其实是 mp4，看不了，给缩略图（第一帧）
         if message.get("animation"):
+            url = await self._file_url(_thumbnail_id(message["animation"]))
+            if url:
+                image_urls.append(url)
             parts.append("[GIF]")
         elif message.get("video"):
             parts.append("[视频]")
@@ -354,10 +472,24 @@ class ContextManager:
             title = message["audio"].get("title", "?")
             parts.append(f"[音频: {title}]")
 
-        # Document (but not GIF)
+        # Document (but not GIF)。「作为文件发送」的图片也走这里——不当成图片的话
+        # 模型就只看到一个文件名
         if message.get("document") and not message.get("animation"):
-            filename = message["document"].get("file_name", "?")
-            parts.append(f"[文件: {filename}]")
+            doc = message["document"]
+            filename = doc.get("file_name", "?")
+            mime = (doc.get("mime_type") or "").lower()
+            if mime in VIEWABLE_IMAGE_MIMES:
+                url = await self._file_url(doc.get("file_id", ""))
+            elif mime.startswith("image/"):
+                # HEIC 之类模型/PetGPT 不收的格式，退到缩略图
+                url = await self._file_url(_thumbnail_id(doc))
+            else:
+                url = None
+            if url:
+                image_urls.append(url)
+                parts.append(f"[图片文件: {filename}]")
+            else:
+                parts.append(f"[文件: {filename}]")
 
         # Location
         if message.get("location"):

@@ -1,5 +1,7 @@
 """Telegram Bot API async client."""
 
+import base64
+import json
 import logging
 from typing import Any
 
@@ -15,6 +17,18 @@ class TelegramAPIError(Exception):
         self.method = method
         self.error_code = error_code
         super().__init__(f"Telegram {method} failed ({error_code}): {description}")
+
+
+def _reply_parameters(reply_to_message_id: int | None) -> dict | None:
+    """引用回复的参数。被引用的那条已经被删掉时照样发，只是不挂引用。
+
+    老写法 reply_to_message_id 遇到被删的消息会让整条发送失败
+    （"message to be replied not found"）——群友发完就撤回、或者管理员删了，
+    bot 那条回复就发不出去了。
+    """
+    if reply_to_message_id is None:
+        return None
+    return {"message_id": int(reply_to_message_id), "allow_sending_without_reply": True}
 
 
 class TelegramClient:
@@ -66,6 +80,10 @@ class TelegramClient:
         """Get info about a chat (group, supergroup, channel, or private)."""
         return await self._call("getChat", chat_id=chat_id)
 
+    async def get_chat_member_count(self, chat_id: str) -> int:
+        """Number of members in a group / supergroup / channel."""
+        return await self._call("getChatMemberCount", chat_id=chat_id)
+
     async def get_updates(
         self, offset: int | None = None, timeout: int = 30, allowed_updates: list[str] | None = None,
     ) -> list[dict]:
@@ -85,19 +103,103 @@ class TelegramClient:
         text: str,
         reply_to_message_id: int | None = None,
         parse_mode: str | None = None,
+        message_thread_id: int | None = None,
     ) -> dict:
-        """Send a text message. Returns the sent Message object."""
+        """Send a text message. Returns the sent Message object.
+
+        message_thread_id targets a forum topic; None means General / a normal chat.
+        """
         return await self._call(
             "sendMessage",
             chat_id=chat_id,
             text=text,
-            reply_to_message_id=reply_to_message_id,
+            reply_parameters=_reply_parameters(reply_to_message_id),
             parse_mode=parse_mode,
+            message_thread_id=message_thread_id,
         )
 
-    async def send_chat_action(self, chat_id: str, action: str = "typing") -> bool:
+    async def send_chat_action(
+        self, chat_id: str, action: str = "typing", message_thread_id: int | None = None
+    ) -> bool:
         """Send a chat action (e.g. 'typing'). Returns True on success."""
-        return await self._call("sendChatAction", chat_id=chat_id, action=action)
+        return await self._call(
+            "sendChatAction", chat_id=chat_id, action=action, message_thread_id=message_thread_id
+        )
+
+    async def send_photo(
+        self,
+        chat_id: str,
+        photo_base64: str,
+        caption: str | None = None,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+    ) -> dict:
+        """Send a photo via multipart upload from base64 data. Returns the sent Message."""
+        session = await self._ensure_session()
+        url = f"{self.base_url}/sendPhoto"
+
+        photo_bytes = base64.b64decode(photo_base64)
+        data = aiohttp.FormData()
+        data.add_field("chat_id", chat_id)
+        data.add_field("photo", photo_bytes, filename="image.jpg", content_type="image/jpeg")
+        if caption:
+            data.add_field("caption", caption)
+        if reply_to_message_id is not None:
+            data.add_field("reply_parameters", json.dumps(_reply_parameters(reply_to_message_id)))
+        if message_thread_id is not None:
+            data.add_field("message_thread_id", str(message_thread_id))
+
+        async with session.post(url, data=data) as resp:
+            result = await resp.json()
+
+        if not result.get("ok", False):
+            raise TelegramAPIError(
+                "sendPhoto",
+                result.get("error_code", -1),
+                result.get("description", "Unknown error"),
+            )
+        return result.get("result")
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        voice_base64: str,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+    ) -> dict:
+        """Send a voice note via multipart upload from base64 audio. Returns the sent Message.
+
+        Telegram plays MP3 / M4A / OGG-OPUS as a voice note; the name and MIME type
+        follow the actual bytes so OGG uploads aren't mislabelled as MP3.
+        """
+        session = await self._ensure_session()
+        url = f"{self.base_url}/sendVoice"
+
+        audio = base64.b64decode(voice_base64)
+        if audio[:4] == b"OggS":
+            filename, mime = "voice.ogg", "audio/ogg"
+        elif audio[4:8] == b"ftyp":
+            filename, mime = "voice.m4a", "audio/mp4"
+        else:
+            filename, mime = "voice.mp3", "audio/mpeg"
+        data = aiohttp.FormData()
+        data.add_field("chat_id", chat_id)
+        data.add_field("voice", audio, filename=filename, content_type=mime)
+        if reply_to_message_id is not None:
+            data.add_field("reply_parameters", json.dumps(_reply_parameters(reply_to_message_id)))
+        if message_thread_id is not None:
+            data.add_field("message_thread_id", str(message_thread_id))
+
+        async with session.post(url, data=data) as resp:
+            result = await resp.json()
+
+        if not result.get("ok", False):
+            raise TelegramAPIError(
+                "sendVoice",
+                result.get("error_code", -1),
+                result.get("description", "Unknown error"),
+            )
+        return result.get("result")
 
     # ── File APIs ───────────────────────────────────────────
 

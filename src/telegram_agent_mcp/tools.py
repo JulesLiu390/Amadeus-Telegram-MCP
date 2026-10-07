@@ -17,6 +17,7 @@ from mcp.types import SamplingMessage, TextContent
 from .config import Config
 from .context import ContextManager, Message
 from .telegram_api import TelegramClient
+from .topics import GENERAL_TOPIC_NAME, make_target, split_target
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,23 @@ CST = timezone(timedelta(hours=8))
 # ── Duplicate send detection ────────────────────────────
 _DEDUP_WINDOW_SECONDS = 60.0
 _sent_history: dict[str, deque[tuple[str, float]]] = {}
+
+# ── </分段> tag-based message splitting ────────────────
+# 不只认 ASCII 的 </分段>：模型常照着 PetGPT 套在消息外面的 ‹…› 分隔符写成 ‹/分段›，
+# 线上原样发出去过「明明聪明得很好不好。‹/分段›别拆我台啊姐姐」。全角、书名号同理。
+_SPLIT_TAG_RE = re.compile(r"[<‹〈＜《«]\s*[/／]?\s*分\s*段\s*[>›〉＞》»]")
+
+
+def _split_by_tag(text: str) -> list[str] | None:
+    """Split text on </分段> tags.
+
+    Returns non-empty stripped segments when the tag is present. Returns None
+    when no tag is found so callers can fall through to other split strategies.
+    """
+    if not text or not _SPLIT_TAG_RE.search(text):
+        return None
+    parts = _SPLIT_TAG_RE.split(text)
+    return [p.strip() for p in parts if p.strip()]
 
 
 def _normalize_content(text: str) -> str:
@@ -157,10 +175,167 @@ def _chunk_message(text: str, max_chars: int = CHUNK_MAX_CHARS) -> list[str]:
     return [c.replace(_PLACEHOLDER, ".") for c in safe_chunks if c]
 
 
+def _decide_chunks(
+    content: str,
+    split_content: bool,
+    num_chunks: int | None,
+) -> list[str]:
+    """Decide how to split outgoing message content into chunks.
+
+    Priority:
+      1. num_chunks == 1        -> single message, tag kept as literal text
+      2. num_chunks >= 2        -> punctuation split, then merge toward N chunks
+      3. </分段> tag in content -> exact manual split, tag stripped
+      4. split_content & >100   -> Telegram-style long-message auto split
+      5. over Telegram limit    -> hard split for API safety
+      6. default                -> single message
+    """
+    stripped = content.strip()
+
+    if num_chunks is not None and num_chunks == 1:
+        return [stripped] if stripped else []
+
+    if num_chunks is not None and num_chunks >= 2 and stripped:
+        fine_chunks = _chunk_message(content)
+        if len(fine_chunks) <= num_chunks:
+            return fine_chunks
+        chunks: list[str] = []
+        per_group = len(fine_chunks) / num_chunks
+        for i in range(num_chunks):
+            start = round(i * per_group)
+            end = round((i + 1) * per_group)
+            chunks.append("\n".join(fine_chunks[start:end]))
+        return chunks
+
+    tag_chunks = _split_by_tag(content)
+    if tag_chunks is not None:
+        return tag_chunks
+
+    if split_content and len(stripped) > 100:
+        return _chunk_message(content)
+
+    if len(stripped) > TELEGRAM_MSG_LIMIT:
+        return _chunk_message(stripped, max_chars=TELEGRAM_MSG_LIMIT)
+
+    return [stripped] if stripped else []
+
+
+# ── 会话列表 ──────────────────────────────────────────────
+
+GROUP_CHAT_TYPES = {"group", "supergroup"}
+
+
+def _split_known_chats(chats: list[dict]) -> tuple[list[dict], list[dict]]:
+    """把已知会话分成群和私聊，输出格式和 qq-mcp 的 get_group_list / get_friend_list 一致。
+
+    前端（PetGPT 的 Watch Targets）按 group_id/group_name 和 user_id/nickname 渲染，
+    两个 MCP 格式对齐它就不用分别处理。频道（channel）两边都不放：bot 在频道里
+    只能发不能聊，不是能「监听」的对象。
+    """
+    groups: list[dict] = []
+    friends: list[dict] = []
+    for c in chats:
+        if c.get("type") in GROUP_CHAT_TYPES:
+            groups.append({
+                "group_id": c["chat_id"],
+                "group_name": c.get("title", ""),
+                "member_count": c.get("member_count", 0),
+            })
+        elif c.get("type") == "private":
+            friends.append({"user_id": c["chat_id"], "nickname": c.get("title", "")})
+    return groups, friends
+
+
 def register_tools(
     mcp: Any, config: Config, bot: TelegramClient, ctx: ContextManager
 ) -> None:
     """Register all MCP tools on the FastMCP server instance."""
+
+    async def _resolve_target(target: str) -> str:
+        """Resolve @username to numeric ID; a ``:thread`` topic suffix is kept as is."""
+        chat, thread = split_target(target)
+        return make_target(await _resolve_chat(chat), thread)
+
+    async def _resolve_chat(target: str) -> str:
+        """Resolve @username to numeric ID with lazy caching."""
+        # Try chat alias first (groups/channels)
+        resolved = config.resolve_chat_id(target)
+        if resolved != target:
+            return resolved
+        # Try user alias (private chats)
+        resolved = config.resolve_user_id(target)
+        if resolved != target:
+            return resolved
+        # Not yet resolved — try lazy resolution via getChat (works for public groups, not users)
+        if target.startswith("@"):
+            try:
+                chat_info = await bot.get_chat(target)
+                numeric_id = str(chat_info.get("id", ""))
+                if numeric_id:
+                    config._chat_aliases[target] = numeric_id
+                    if config.chat_ids:
+                        config.chat_ids.add(numeric_id)
+                    logger.info("Lazy-resolved alias %s → %s", target, numeric_id)
+                    return numeric_id
+            except Exception as e:
+                logger.warning("Failed to lazy-resolve %s: %s", target, e)
+        return target
+
+    async def _known_chats(with_member_count: bool = False) -> list[dict]:
+        """bot 能知道的全部会话：白名单里配的 + 运行以来收到过消息的。
+
+        Bot API 没有「列出我所在的群」这种接口，只能这样凑——所以 bot 刚启动、
+        群里还没人说过话时，没写进白名单的群是看不见的。
+        """
+        # 白名单里的 @username 先换成数字 ID，免得和 buffer 里的同一个群重复
+        ids: set[str] = set()
+        if config.chat_ids:
+            for cid in config.chat_ids:
+                chat, thread = split_target(cid)
+                ids.add(make_target(config.resolve_chat_id(chat), thread))
+        ids.update(ctx.buffer_stats.get("active_chat_ids", []))
+
+        # 论坛群的每个话题单独成一项，标题写成「群名 / 话题名」。同一个群的
+        # getChat / 成员数只查一次
+        infos: dict[str, dict | None] = {}
+        counts: dict[str, int] = {}
+        chats: list[dict] = []
+        for target in sorted(ids):
+            cid, thread = split_target(target)
+            if cid not in infos:
+                try:
+                    infos[cid] = await bot.get_chat(cid)
+                except Exception:
+                    infos[cid] = None
+            info = infos[cid]
+            if info is None:
+                chats.append({"chat_id": target, "title": "", "type": "unknown"})
+                continue
+            title = info.get("title", info.get("first_name", ""))
+            if thread:
+                title = f"{title} / {ctx.topic_name(target) or f'话题 #{thread}'}"
+            elif info.get("is_forum"):
+                title = f"{title} / {GENERAL_TOPIC_NAME}"
+            chat = {"chat_id": target, "title": title, "type": info.get("type", "")}
+            if with_member_count and chat["type"] in GROUP_CHAT_TYPES:
+                if cid not in counts:
+                    try:
+                        counts[cid] = await bot.get_chat_member_count(cid)
+                    except Exception:
+                        counts[cid] = 0
+                chat["member_count"] = counts[cid]
+            chats.append(chat)
+        return chats
+
+    def _is_target_monitored(chat_id: str) -> bool:
+        """Check if a target is monitored as either a chat or a user.
+
+        A topic counts if its whole group is monitored or the topic itself is listed.
+        """
+        chat, thread = split_target(chat_id)
+        if thread and config.is_chat_monitored(chat_id):
+            return True
+        return config.is_chat_monitored(chat) or config.is_user_monitored(chat)
 
     @mcp.tool()
     async def check_status() -> dict:
@@ -173,24 +348,7 @@ def register_tools(
                 "error": str(e),
             }
 
-        # Collect chat IDs to resolve: from whitelist config or from active buffers
-        chat_ids_to_resolve: set[str] = set()
-        if config.chat_ids:
-            chat_ids_to_resolve.update(config.chat_ids)
-        # Also include chats discovered at runtime (from buffer)
-        chat_ids_to_resolve.update(ctx.buffer_stats.get("active_chat_ids", []))
-
-        monitored_chats: list[dict] = []
-        for cid in chat_ids_to_resolve:
-            try:
-                chat_info = await bot.get_chat(cid)
-                monitored_chats.append({
-                    "chat_id": cid,
-                    "title": chat_info.get("title", chat_info.get("first_name", "")),
-                    "type": chat_info.get("type", ""),
-                })
-            except Exception:
-                monitored_chats.append({"chat_id": cid, "title": "", "type": "unknown"})
+        monitored_chats = await _known_chats()
 
         return {
             "bot_running": True,
@@ -204,6 +362,30 @@ def register_tools(
         }
 
     @mcp.tool()
+    async def get_group_list() -> dict:
+        """List the Telegram groups the bot knows about.
+
+        Telegram's Bot API cannot enumerate a bot's groups, so this covers groups in the
+        configured whitelist plus any group that has sent a message since the bot started.
+        A group the bot was added to but that has been silent since startup will not appear.
+
+        Each topic of a forum group is listed as its own group, with group_id
+        "chat_id:thread_id" and name "Group / Topic"; the forum's General topic is the
+        bare chat_id. Topics are only known once someone has posted in them.
+        """
+        groups, _ = _split_known_chats(await _known_chats(with_member_count=True))
+        return {"groups": groups}
+
+    @mcp.tool()
+    async def get_friend_list() -> dict:
+        """List private chats the bot knows about (users who have messaged it since startup).
+
+        Same Bot API limitation as get_group_list: a user only appears after messaging the bot.
+        """
+        _, friends = _split_known_chats(await _known_chats())
+        return {"friends": friends}
+
+    @mcp.tool()
     async def get_recent_context(
         target: str,
         target_type: str = "group",
@@ -215,16 +397,18 @@ def register_tools(
         Use compress_context to manually compress when needed.
 
         Args:
-            target: Telegram chat ID (group, supergroup, or private chat).
+            target: Telegram chat ID (group, supergroup, or private chat), or
+                "chat_id:thread_id" for one topic of a forum group.
             target_type: 'group' or 'private' (for interface compatibility).
             limit: Number of recent messages to return (default 200).
         """
-        chat_id = target
-        if not config.is_chat_monitored(chat_id):
+        chat_id = await _resolve_target(target)
+        if not _is_target_monitored(chat_id):
             return {"error": f"Chat {chat_id} is not monitored"}
 
         limit = max(1, limit)
         result = ctx.get_context(chat_id, limit)
+        result["target"] = target  # preserve original @username
 
         try:
             chat_info = await bot.get_chat(chat_id)
@@ -254,13 +438,15 @@ def register_tools(
 
         results: list[dict] = []
         for entry in targets:
-            chat_id = entry.get("target", "") if isinstance(entry, dict) else str(entry)
+            raw_id = entry.get("target", "") if isinstance(entry, dict) else str(entry)
+            chat_id = await _resolve_target(raw_id)
 
-            if not config.is_chat_monitored(chat_id):
-                results.append({"target": chat_id, "error": f"Chat {chat_id} is not monitored"})
+            if not _is_target_monitored(chat_id):
+                results.append({"target": raw_id, "error": f"Chat {raw_id} is not monitored"})
                 continue
 
             result = ctx.get_context(chat_id, limit)
+            result["target"] = raw_id  # preserve original @username
 
             try:
                 chat_info = await bot.get_chat(chat_id)
@@ -288,19 +474,24 @@ def register_tools(
     ) -> dict:
         """Send a message to a monitored Telegram chat.
 
+        Preferred way to send multiple messages: insert `</分段>` in the content
+        at each desired split point. Each segment becomes its own message and
+        the tag itself is stripped.
+
         Args:
-            target: Telegram chat ID.
-            content: Text message content.
+            target: Telegram chat ID, or "chat_id:thread_id" for a forum topic.
+            content: Text message content. May contain `</分段>` markers to
+                specify exact split points between messages.
             target_type: 'group' or 'private' (for interface compatibility).
             reply_to: Optional message ID to reply to.
-            split_content: Whether to split long messages into multiple chunks
-                with typing delay (default True). Set to False to send as a
-                single message without splitting.
+            split_content: If True (and content has no `</分段>` tag), split
+                long messages into multiple chunks with typing delay.
             num_chunks: If set, split the message into exactly this many chunks
-                using natural punctuation boundaries. Overrides split_content.
+                using natural punctuation boundaries. Overrides the `</分段>`
+                tag. Set to 1 to force a single message.
         """
-        chat_id = target
-        if not config.is_chat_monitored(chat_id):
+        chat_id = await _resolve_target(target)
+        if not _is_target_monitored(chat_id):
             return {"success": False, "error": f"Chat {chat_id} is not monitored"}
 
         # Rate limit
@@ -316,31 +507,14 @@ def register_tools(
         if dup_warning:
             return {"success": False, "error": dup_warning}
 
-        # Split into chunks
-        stripped = content.strip()
-        if num_chunks is not None and num_chunks >= 2 and stripped:
-            fine_chunks = _chunk_message(content)
-            if len(fine_chunks) <= num_chunks:
-                chunks = fine_chunks
-            else:
-                chunks = []
-                per_group = len(fine_chunks) / num_chunks
-                for i in range(num_chunks):
-                    start = round(i * per_group)
-                    end = round((i + 1) * per_group)
-                    chunks.append("\n".join(fine_chunks[start:end]))
-        elif split_content and len(stripped) > 100:
-            chunks = _chunk_message(content)
-        else:
-            if len(stripped) > TELEGRAM_MSG_LIMIT:
-                chunks = _chunk_message(stripped, max_chars=TELEGRAM_MSG_LIMIT)
-            else:
-                chunks = [stripped] if stripped else []
+        chunks = _decide_chunks(content, split_content, num_chunks)
         if not chunks:
             return {"success": False, "error": "Empty message content"}
 
         sent_ids: list[int] = []
         first_reply_to = reply_to
+        # chat_id 可能是 "群:话题"，簿记都按它算；只有真正调 API 时才拆开
+        api_chat, thread_id = split_target(chat_id)
         t0 = time.time()
 
         try:
@@ -351,18 +525,21 @@ def register_tools(
 
                 # Send typing indicator
                 try:
-                    await bot.send_chat_action(chat_id, "typing")
+                    await bot.send_chat_action(api_chat, "typing", message_thread_id=thread_id)
                 except Exception:
                     pass
 
                 rto = first_reply_to if i == 0 else None
-                result = await bot.send_message(chat_id, chunk_text, reply_to_message_id=rto)
+                result = await bot.send_message(
+                    api_chat, chunk_text, reply_to_message_id=rto, message_thread_id=thread_id
+                )
 
                 msg_id = result.get("message_id", 0)
                 sent_ids.append(msg_id)
 
+                bot_sender_id = f"@{ctx._bot_username}" if ctx._bot_username else config.bot_id
                 bot_msg = Message(
-                    sender_id=config.bot_id,
+                    sender_id=bot_sender_id,
                     sender_name="bot",
                     content=chunk_text,
                     timestamp=datetime.now(CST).isoformat(),
@@ -398,9 +575,135 @@ def register_tools(
             "success": True,
             "message_ids": sent_ids,
             "chunks": len(chunks),
-            "target": chat_id,
+            "target": target,
             "timestamp": datetime.now(CST).isoformat(),
             "recent_messages": recent_lines,
+        }
+
+    @mcp.tool()
+    async def send_image(
+        target: str,
+        image: str,
+        target_type: str = "group",
+        reply_to: int | None = None,
+    ) -> dict:
+        """Send an image to a monitored Telegram chat.
+
+        Args:
+            target: Telegram chat ID, or "chat_id:thread_id" for a forum topic.
+            image: Base64-encoded image data (raw base64, no prefix).
+            target_type: 'group' or 'private' (for interface compatibility).
+            reply_to: Optional message ID to reply to.
+        """
+        chat_id = await _resolve_target(target)
+        if not _is_target_monitored(chat_id):
+            return {"success": False, "error": f"Chat {chat_id} is not monitored"}
+
+        # Rate limit
+        now = time.time()
+        last = _last_send.get(chat_id, 0)
+        if now - last < RATE_LIMIT_SECONDS:
+            wait = RATE_LIMIT_SECONDS - (now - last)
+            return {"success": False, "error": f"Rate limited. Try again in {wait:.1f}s"}
+        _last_send[chat_id] = now
+
+        api_chat, thread_id = split_target(chat_id)
+        try:
+            await bot.send_chat_action(api_chat, "upload_photo", message_thread_id=thread_id)
+        except Exception:
+            pass
+
+        try:
+            result = await bot.send_photo(
+                api_chat,
+                image,
+                reply_to_message_id=reply_to,
+                message_thread_id=thread_id,
+            )
+        except Exception as e:
+            _last_send[chat_id] = last
+            return {"success": False, "error": str(e)}
+
+        msg_id = result.get("message_id", 0)
+
+        bot_sender_id = f"@{ctx._bot_username}" if ctx._bot_username else config.bot_id
+        bot_msg = Message(
+            sender_id=bot_sender_id,
+            sender_name="bot",
+            content="[图片]",
+            timestamp=datetime.now(CST).isoformat(),
+            message_id=str(msg_id),
+            chat_id=chat_id,
+            is_self=True,
+        )
+        ctx.add_message(chat_id, bot_msg)
+
+        return {
+            "success": True,
+            "message_id": str(msg_id),
+            "target": target,
+            "target_type": target_type,
+            "timestamp": datetime.now(CST).isoformat(),
+        }
+
+    @mcp.tool()
+    async def send_voice(
+        target: str,
+        audio: str,
+        target_type: str = "group",
+        reply_to: int | None = None,
+    ) -> dict:
+        """Send a voice message to a monitored Telegram chat (same contract as qq-mcp's send_voice).
+
+        Args:
+            target: Telegram chat ID, or "chat_id:thread_id" for a forum topic.
+            audio: Base64-encoded audio (no prefix). MP3, M4A and OGG/OPUS are accepted
+                by Telegram as voice notes; PetGPT's ElevenLabs TTS produces MP3.
+            target_type: 'group' or 'private' (for interface compatibility).
+            reply_to: Optional message ID to reply to.
+        """
+        chat_id = await _resolve_target(target)
+        if not _is_target_monitored(chat_id):
+            return {"success": False, "error": f"Chat {chat_id} is not monitored"}
+
+        now = time.time()
+        last = _last_send.get(chat_id, 0)
+        if now - last < RATE_LIMIT_SECONDS:
+            wait = RATE_LIMIT_SECONDS - (now - last)
+            return {"success": False, "error": f"Rate limited. Try again in {wait:.1f}s"}
+        _last_send[chat_id] = now
+
+        api_chat, thread_id = split_target(chat_id)
+        try:
+            await bot.send_chat_action(api_chat, "record_voice", message_thread_id=thread_id)
+        except Exception:
+            pass
+
+        try:
+            result = await bot.send_voice(
+                api_chat, audio, reply_to_message_id=reply_to, message_thread_id=thread_id,
+            )
+        except Exception as e:
+            _last_send[chat_id] = last
+            return {"success": False, "error": str(e)}
+
+        msg_id = result.get("message_id", 0)
+        bot_sender_id = f"@{ctx._bot_username}" if ctx._bot_username else config.bot_id
+        ctx.add_message(chat_id, Message(
+            sender_id=bot_sender_id,
+            sender_name="bot",
+            content="[语音]",
+            timestamp=datetime.now(CST).isoformat(),
+            message_id=str(msg_id),
+            chat_id=chat_id,
+            is_self=True,
+        ))
+        return {
+            "success": True,
+            "message_id": str(msg_id),
+            "target": target,
+            "target_type": target_type,
+            "timestamp": datetime.now(CST).isoformat(),
         }
 
     @mcp.tool()
@@ -414,11 +717,11 @@ def register_tools(
         This replaces raw messages with a compressed summary, freeing up the buffer.
 
         Args:
-            target: Telegram chat ID.
+            target: Telegram chat ID, or "chat_id:thread_id" for a forum topic.
             target_type: 'group' or 'private' (for interface compatibility).
         """
-        chat_id = target
-        if not config.is_chat_monitored(chat_id):
+        chat_id = await _resolve_target(target)
+        if not _is_target_monitored(chat_id):
             return {"error": f"Chat {chat_id} is not monitored"}
 
         key = ctx._buffer_key(chat_id)

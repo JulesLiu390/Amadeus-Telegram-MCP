@@ -7,9 +7,11 @@ import pytest
 from telegram_agent_mcp.tools import (
     _chunk_message,
     _check_duplicate,
+    _decide_chunks,
     _normalize_content,
     _human_delay_for_chunk,
     _rule_based_compress,
+    _split_by_tag,
     _sent_history,
     TELEGRAM_MSG_LIMIT,
 )
@@ -149,6 +151,93 @@ class TestChunkMessage:
         assert chunks[0] == "短消息"
 
 
+# ── </分段> tag splitting ─────────────────────────────────
+
+class TestSplitTag:
+    def test_no_tag_returns_none(self):
+        assert _split_by_tag("普通消息没有标签") is None
+
+    def test_single_tag_splits_into_two(self):
+        assert _split_by_tag("吃了吗</分段>今天忙不忙") == ["吃了吗", "今天忙不忙"]
+
+    def test_multiple_tags_split_into_n(self):
+        assert _split_by_tag("一</分段>二</分段>三") == ["一", "二", "三"]
+
+    def test_consecutive_tags_drop_empty(self):
+        assert _split_by_tag("前</分段></分段>后") == ["前", "后"]
+
+    def test_leading_tag_dropped(self):
+        assert _split_by_tag("</分段>内容") == ["内容"]
+
+    def test_trailing_tag_dropped(self):
+        assert _split_by_tag("内容</分段>") == ["内容"]
+
+    def test_whitespace_around_tag_stripped(self):
+        assert _split_by_tag("前面  </分段>  后面") == ["前面", "后面"]
+
+    def test_newlines_around_tag_stripped(self):
+        assert _split_by_tag("前面\n</分段>\n后面") == ["前面", "后面"]
+
+    def test_tag_with_inner_whitespace_tolerated(self):
+        assert _split_by_tag("前</ 分段 >后") == ["前", "后"]
+
+    def test_self_closing_tag_is_not_a_splitter(self):
+        assert _split_by_tag("前<分段/>后") is None
+
+    def test_only_tag_returns_empty_list(self):
+        assert _split_by_tag("</分段>") == []
+
+    def test_empty_string_returns_none(self):
+        assert _split_by_tag("") is None
+
+
+# ── _decide_chunks ────────────────────────────────────────
+
+class TestDecideChunks:
+    def test_no_split_plain_text(self):
+        assert _decide_chunks("你好", split_content=False, num_chunks=None) == ["你好"]
+
+    def test_strips_outer_whitespace(self):
+        assert _decide_chunks("  hi  ", split_content=False, num_chunks=None) == ["hi"]
+
+    def test_empty_returns_empty_list(self):
+        assert _decide_chunks("   ", split_content=False, num_chunks=None) == []
+
+    def test_tag_splits_by_default(self):
+        assert _decide_chunks(
+            "吃了吗</分段>今天忙不忙", split_content=False, num_chunks=None
+        ) == ["吃了吗", "今天忙不忙"]
+
+    def test_num_chunks_1_overrides_tag(self):
+        assert _decide_chunks(
+            "吃了吗</分段>今天忙不忙", split_content=False, num_chunks=1
+        ) == ["吃了吗</分段>今天忙不忙"]
+
+    def test_num_chunks_overrides_tag(self):
+        result = _decide_chunks(
+            "吃了吗</分段>今天忙不忙", split_content=False, num_chunks=2
+        )
+        assert result != ["吃了吗", "今天忙不忙"]
+        assert "</分段>" in "".join(result)
+
+    def test_tag_chunks_not_further_split_by_punctuation(self):
+        assert _decide_chunks(
+            "你好</分段>今天,天气,真的,非常,好,我们,去,公园,玩,好不好",
+            split_content=False,
+            num_chunks=None,
+        ) == ["你好", "今天,天气,真的,非常,好,我们,去,公园,玩,好不好"]
+
+    def test_tag_wins_over_split_content(self):
+        assert _decide_chunks(
+            "一段</分段>另一段", split_content=True, num_chunks=None
+        ) == ["一段", "另一段"]
+
+    def test_split_content_keeps_telegram_long_message_behavior(self):
+        text = "这是一个比较长的句子，" * 30
+        result = _decide_chunks(text, split_content=True, num_chunks=None)
+        assert len(result) > 1
+
+
 # ── _rule_based_compress ──────────────────────────────────
 
 class TestRuleBasedCompress:
@@ -172,3 +261,15 @@ class TestRuleBasedCompress:
         result = _rule_based_compress(msgs)
         assert "..." in result
         assert len(result) < 200
+
+
+# ── 分段标记的各种写法 ─────────────────────────────────────
+
+@pytest.mark.parametrize("tag", ["</分段>", "‹/分段›", "＜/分段＞", "〈/分段〉", "</ 分段 >", "<分段>"])
+def test_split_tag_variants_all_split(tag):
+    # 线上原样发出去过：「明明聪明得很好不好。‹/分段›别拆我台啊姐姐」
+    assert _split_by_tag(f"明明聪明得很好不好。{tag}别拆我台啊姐姐") == ["明明聪明得很好不好。", "别拆我台啊姐姐"]
+
+
+def test_text_that_merely_mentions_segments_is_not_split():
+    assert _split_by_tag("我们分段来讲") is None

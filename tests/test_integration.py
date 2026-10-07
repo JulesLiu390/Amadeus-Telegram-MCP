@@ -84,12 +84,11 @@ async def test_mcp_initialize_and_tools_list(project_dir):
         assert "result" in resp, f"tools/list failed: {resp}"
         tools = resp["result"].get("tools", [])
         tool_names = sorted(t["name"] for t in tools)
-        assert "check_status" in tool_names
-        assert "send_message" in tool_names
-        assert "get_recent_context" in tool_names
-        assert "batch_get_recent_context" in tool_names
-        assert "compress_context" in tool_names
-        assert len(tool_names) == 5
+        assert tool_names == sorted([
+            "check_status", "get_group_list", "get_friend_list", "get_recent_context",
+            "batch_get_recent_context", "send_message", "send_image", "send_voice",
+            "compress_context",
+        ])
 
         # 3. Call check_status — will report bot_running=False (fake token)
         await _send(proc, {

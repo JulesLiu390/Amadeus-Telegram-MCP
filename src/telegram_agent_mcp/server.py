@@ -16,6 +16,23 @@ logger = logging.getLogger(__name__)
 MAX_READY_WAIT = 30  # seconds to wait for Telegram API to respond
 
 
+async def _resolve_chat_aliases(config: Config, bot: TelegramClient) -> None:
+    """Resolve any @username entries in chat_ids to numeric IDs."""
+    if not config.chat_ids:
+        return
+    for cid in list(config.chat_ids):
+        if cid.startswith("@"):
+            try:
+                chat_info = await bot.get_chat(cid)
+                numeric_id = str(chat_info.get("id", ""))
+                if numeric_id:
+                    config._chat_aliases[cid] = numeric_id
+                    config.chat_ids.add(numeric_id)
+                    logger.info("Resolved chat alias %s → %s", cid, numeric_id)
+            except Exception as e:
+                logger.warning("Failed to resolve chat alias %s: %s", cid, e)
+
+
 async def _wait_ready(bot: TelegramClient, timeout: float = MAX_READY_WAIT) -> dict | None:
     """Call getMe until reachable or timeout. Returns bot info on success."""
     deadline = asyncio.get_event_loop().time() + timeout
@@ -44,6 +61,8 @@ def create_server(config: Config) -> FastMCP:
     @asynccontextmanager
     async def lifespan(app: FastMCP):
         me = await _wait_ready(bot)
+        if me:
+            await _resolve_chat_aliases(config, bot)
         bot_username = me.get("username", "") if me else ""
         ctx.start(bot_username=bot_username)
         logger.info("Long-polling listener started (bot: @%s)", bot_username)

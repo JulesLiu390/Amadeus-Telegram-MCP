@@ -452,9 +452,8 @@ class TestParseMessage:
             "chat": {"id": 1},
             "from": {"id": 42},
         })
-        assert "nice photo!" in content
-        # Should NOT add [图片] when caption is present
-        assert "[图片]" not in content
+        # 配文在前、图片标记在后：图没送到模型时，它仍然知道有过一张图
+        assert content == "nice photo! [图片]"
 
 
 # ── ContextManager._handle_message ────────────────────────
